@@ -1,0 +1,16 @@
+pandas
+numpy
+scikit-learn
+scipy
+streamlit
+plotly
+pytest
+yfinance
+pyportfolioopt
+PySide6
+matplotlib
+
+
+
+
+ 
