@@ -18,7 +18,7 @@ python3 app.py
 
 ## Project Structure
 
-- `app/` — Streamlit entry point
+- `app/` — Frontend for desktop app
 - `src/data/` — Data fetching, pipeline, and SQLite storage
 - `src/optimization/` — MPT engine (SciPy)
 - `src/prediction/` — Returns estimation (Scikit-learn)
