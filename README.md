@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-streamlit run app/streamlit_app.py
+python3 app.py
 ```
 
 ## Project Structure
