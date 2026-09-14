@@ -190,12 +190,16 @@ class PortfolioOptimizer:
         expected_returns: pd.Series,
         cov_matrix: pd.DataFrame,
         risk_free_rate: float,
+        bounds: Tuple[Tuple[float, float], ...] | None = None,
+        extra_constraints: List[Dict[str, object]] | None = None,
+        failure_context: str = "",
     ) -> Dict[str, object]:
         """
         Run the constrained SLSQP optimization to maximize the Sharpe ratio.
 
-        Shared by all `optimize_max_sharpe*` variants once each has
-        produced its own estimate of `expected_returns` and `cov_matrix`.
+        Shared by all `optimize_max_sharpe*`/`optimize_with_constraints`
+        variants once each has produced its own estimate of
+        `expected_returns` and `cov_matrix`.
 
         Args:
             tickers (List[str]): Ticker strings, aligned with the order of
@@ -205,6 +209,20 @@ class PortfolioOptimizer:
             cov_matrix (pd.DataFrame): Annualized covariance matrix.
             risk_free_rate (float): The risk-free rate used in the Sharpe
                 ratio calculation.
+            bounds (Tuple[Tuple[float, float], ...] | None, optional): Per-
+                asset weight bounds. Defaults to `None`, which resolves to
+                the standard long-only `(0.0, 1.0)` bound for every asset
+                -- i.e. identical behavior to the original implementation.
+            extra_constraints (List[Dict[str, object]] | None, optional):
+                Additional `scipy.optimize.minimize` constraint dicts to
+                layer on top of the mandatory fully-invested equality
+                constraint (e.g. a minimum-return or maximum-volatility
+                inequality constraint). Defaults to `None` (no extra
+                constraints), matching the original implementation.
+            failure_context (str, optional): Extra text appended to the
+                convergence-failure error message to help identify *why*
+                a constrained solve failed (e.g. which constraints were
+                active). Defaults to `""`.
 
         Returns:
             Dict[str, object]: A dictionary with the following keys:
@@ -221,14 +239,16 @@ class PortfolioOptimizer:
         initial_weights: np.ndarray = np.repeat(1.0 / num_assets, num_assets)
 
         # Constraint: sum of weights must equal 1.0 (fully invested).
-        constraints: Tuple[Dict[str, object], ...] = (
+        constraints: List[Dict[str, object]] = [
             {"type": "eq", "fun": lambda weights: np.sum(weights) - 1.0},
-        )
+        ]
+        if extra_constraints:
+            constraints.extend(extra_constraints)
 
-        # Bounds: no short-selling, weights strictly within [0.0, 1.0].
-        bounds: Tuple[Tuple[float, float], ...] = tuple(
-            (0.0, 1.0) for _ in range(num_assets)
-        )
+        # Bounds: no short-selling by default, weights strictly within
+        # [0.0, 1.0], unless the caller supplied custom per-asset bounds.
+        if bounds is None:
+            bounds = tuple((0.0, 1.0) for _ in range(num_assets))
 
         optimization_result = minimize(
             fun=self._negative_sharpe_ratio,
@@ -236,13 +256,13 @@ class PortfolioOptimizer:
             args=(expected_returns, cov_matrix, risk_free_rate),
             method="SLSQP",
             bounds=bounds,
-            constraints=constraints,
+            constraints=tuple(constraints),
         )
 
         if not optimization_result.success:
             raise ValueError(
                 f"Portfolio optimization failed to converge: "
-                f"{optimization_result.message}"
+                f"{optimization_result.message}{failure_context}"
             )
 
         optimal_weights: np.ndarray = optimization_result.x
@@ -314,6 +334,162 @@ class PortfolioOptimizer:
 
         return self._solve_max_sharpe(
             tickers, expected_returns, cov_matrix, risk_free_rate
+        )
+
+    def optimize_with_constraints(
+        self,
+        tickers: List[str],
+        risk_free_rate: float = 0.0,
+        min_return: float | None = None,
+        max_volatility: float | None = None,
+        min_weight: float = 0.0,
+        max_weight: float = 1.0,
+    ) -> Dict[str, object]:
+        """
+        Generate a Max Sharpe Ratio portfolio subject to user-supplied
+        return, volatility, and allocation constraints.
+
+        This mirrors `optimize_max_sharpe` (same historical sample
+        covariance/expected-return estimates, same fully-invested,
+        long-only-by-default objective), but layers on up to three
+        optional constraints:
+
+        - A minimum acceptable annualized portfolio return.
+        - A maximum acceptable annualized portfolio volatility.
+        - A per-asset allocation band (the same `[min_weight, max_weight]`
+          bound is applied to every asset in `tickers`), e.g. to cap
+          concentration in any single position or to force a minimum
+          stake in every selected asset.
+
+        Any constraint left at its default is simply not imposed, so
+        calling this with no optional arguments reproduces the same
+        result as `optimize_max_sharpe`.
+
+        Args:
+            tickers (List[str]): List of ticker strings to include in the
+                optimization universe. Must all be present as columns in
+                the internal log returns DataFrame.
+            risk_free_rate (float, optional): The risk-free rate used in
+                the Sharpe ratio calculation. Defaults to 0.0.
+            min_return (float | None, optional): Minimum acceptable
+                annualized portfolio return (e.g. `0.10` for 10%). `None`
+                (the default) imposes no return floor.
+            max_volatility (float | None, optional): Maximum acceptable
+                annualized portfolio volatility (e.g. `0.20` for 20%).
+                `None` (the default) imposes no volatility ceiling.
+            min_weight (float, optional): Minimum allocation any single
+                asset may receive, as a fraction of the portfolio (e.g.
+                `0.05` for 5%). Defaults to `0.0`.
+            max_weight (float, optional): Maximum allocation any single
+                asset may receive, as a fraction of the portfolio (e.g.
+                `0.30` for 30%). Defaults to `1.0`.
+
+        Returns:
+            Dict[str, object]: A dictionary with the following keys:
+                - 'weights' (Dict[str, float]): Optimal weight per ticker.
+                - 'return' (float): Optimized annualized portfolio return.
+                - 'volatility' (float): Optimized annualized portfolio
+                  volatility.
+                - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
+
+        Raises:
+            ValueError: If `tickers` is empty, contains tickers not found
+                in the dataset; if `min_weight`/`max_weight` are invalid
+                or make the fully-invested constraint infeasible on their
+                own (e.g. `min_weight` too high for the number of assets);
+                or if the optimizer fails to converge given the requested
+                constraints (which most often means `min_return` and
+                `max_volatility` are jointly unreachable for this asset
+                universe).
+        """
+        if not (0.0 <= min_weight <= max_weight <= 1.0):
+            raise ValueError(
+                "Invalid allocation bounds: require "
+                f"0.0 <= min_weight <= max_weight <= 1.0 "
+                f"(got min_weight={min_weight}, max_weight={max_weight})."
+            )
+
+        num_assets: int = len(tickers)
+
+        # A per-asset floor of `min_weight` across `num_assets` assets can
+        # only be met if the assets collectively allow at least 100%
+        # allocation; likewise a per-asset ceiling of `max_weight` must
+        # allow at least 100% in aggregate. Catch these infeasible cases
+        # up front with a clear message instead of letting SLSQP fail
+        # silently with a generic non-convergence error.
+        if min_weight * num_assets > 1.0 + 1e-9:
+            raise ValueError(
+                f"Infeasible allocation constraint: a minimum of "
+                f"{min_weight:.2%} per asset across {num_assets} assets "
+                f"requires at least {min_weight * num_assets:.2%} total "
+                "allocation, which exceeds 100%. Lower min_weight or "
+                "select more tickers."
+            )
+        if max_weight * num_assets < 1.0 - 1e-9:
+            raise ValueError(
+                f"Infeasible allocation constraint: a maximum of "
+                f"{max_weight:.2%} per asset across {num_assets} assets "
+                f"allows at most {max_weight * num_assets:.2%} total "
+                "allocation, which is less than 100%. Raise max_weight or "
+                "select more tickers."
+            )
+
+        filtered_returns: pd.DataFrame = self._get_filtered_returns(tickers)
+
+        # Same historical annualized expected-return and sample covariance
+        # estimates as `optimize_max_sharpe`, so the only difference in
+        # the result comes from the constraints applied below.
+        expected_returns: pd.Series = filtered_returns.mean() * TRADING_DAYS_PER_YEAR
+        cov_matrix: pd.DataFrame = filtered_returns.cov() * TRADING_DAYS_PER_YEAR
+
+        extra_constraints: List[Dict[str, object]] = []
+        failure_context_parts: List[str] = []
+
+        if min_return is not None:
+            # Inequality constraint form for SLSQP is `fun(weights) >= 0`,
+            # so `portfolio_return - min_return >= 0`.
+            extra_constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weights, er=expected_returns: (
+                        float(np.dot(weights, er)) - min_return
+                    ),
+                }
+            )
+            failure_context_parts.append(f"min_return={min_return:.2%}")
+
+        if max_volatility is not None:
+            # `max_volatility - portfolio_volatility >= 0`.
+            extra_constraints.append(
+                {
+                    "type": "ineq",
+                    "fun": lambda weights, cm=cov_matrix: (
+                        max_volatility
+                        - float(np.sqrt(np.dot(weights.T, np.dot(cm, weights))))
+                    ),
+                }
+            )
+            failure_context_parts.append(f"max_volatility={max_volatility:.2%}")
+
+        bounds: Tuple[Tuple[float, float], ...] = tuple(
+            (min_weight, max_weight) for _ in range(num_assets)
+        )
+        failure_context_parts.append(
+            f"allocation range=[{min_weight:.2%}, {max_weight:.2%}] per asset"
+        )
+        failure_context: str = (
+            " Active constraints: " + ", ".join(failure_context_parts) + ". "
+            "Try relaxing one or more constraints."
+        )
+
+        return self._solve_max_sharpe(
+            tickers,
+            expected_returns,
+            cov_matrix,
+            risk_free_rate,
+            bounds=bounds,
+            extra_constraints=extra_constraints,
+            failure_context=failure_context,
         )
 
     def optimize_max_sharpe_shrinkage(

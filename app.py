@@ -15,7 +15,8 @@ Structure (top to bottom):
     1. Constants
     2. DataCache          -- manual cache replacing st.cache_resource/cache_data
     3. OptimizationWorker -- QThread pipeline runner (keeps the UI responsive)
-    4. ConfigurationPanel -- left sidebar: assets, dates, risk-free rate
+    4. ConfigurationPanel -- left sidebar: assets, dates, risk-free rate,
+                             and optional Generate Portfolio constraints
     5. MetricCard / DonutChart -- small display widgets
     6. ResultsPanel       -- metrics + chart + allocation table
     7. MainWindow         -- wires everything together
@@ -38,7 +39,9 @@ from PySide6.QtCore import QDate, Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QDateEdit,
+    QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -203,6 +206,7 @@ class OptimizationWorker(QThread):
         start_date: str,
         end_date: str,
         risk_free_rate: float,
+        constraints: Optional[Dict[str, Optional[float]]] = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -211,6 +215,13 @@ class OptimizationWorker(QThread):
         self._start_date = start_date
         self._end_date = end_date
         self._risk_free_rate = risk_free_rate
+        # Optional Generate Portfolio constraints: 'min_return' and
+        # 'max_volatility' are each a fraction or None (no constraint);
+        # 'min_weight'/'max_weight' are fractions defaulting to the
+        # unconstrained (0.0, 1.0) allocation range. Defaults to an empty
+        # dict so a worker constructed the old way (no constraints arg)
+        # behaves exactly as before.
+        self._constraints: Dict[str, Optional[float]] = constraints or {}
  
     def run(self) -> None:  # noqa: D102 -- Qt override, not a public API method
         try:
@@ -234,9 +245,34 @@ class OptimizationWorker(QThread):
                 return
  
             optimizer = PortfolioOptimizer(log_returns_df)
-            result = optimizer.optimize_max_sharpe(
-                tickers=self._tickers, risk_free_rate=self._risk_free_rate
+
+            min_return = self._constraints.get("min_return")
+            max_volatility = self._constraints.get("max_volatility")
+            min_weight = self._constraints.get("min_weight") or 0.0
+            max_weight = self._constraints.get("max_weight")
+            if max_weight is None:
+                max_weight = 1.0
+
+            constraints_active = (
+                min_return is not None
+                or max_volatility is not None
+                or min_weight > 0.0
+                or max_weight < 1.0
             )
+
+            if constraints_active:
+                result = optimizer.optimize_with_constraints(
+                    tickers=self._tickers,
+                    risk_free_rate=self._risk_free_rate,
+                    min_return=min_return,
+                    max_volatility=max_volatility,
+                    min_weight=min_weight,
+                    max_weight=max_weight,
+                )
+            else:
+                result = optimizer.optimize_max_sharpe(
+                    tickers=self._tickers, risk_free_rate=self._risk_free_rate
+                )
             self.succeeded.emit(result)
         except ValueError as error:
             self.failed.emit(f"Portfolio optimization failed: {error}")
@@ -259,7 +295,7 @@ class ConfigurationPanel(QWidget):
     callers.
     """
  
-    run_requested = Signal(list, str, str, float)
+    run_requested = Signal(list, str, str, float, dict)
  
     def __init__(
         self, available_tickers: List[str], parent: Optional[QWidget] = None
@@ -325,17 +361,74 @@ class ConfigurationPanel(QWidget):
         slider_row.addWidget(self._risk_free_value_label)
         risk_layout.addLayout(slider_row)
         layout.addWidget(risk_group)
- 
+
+        # -- Generate Portfolio: constraints (optional) ----------------------
+        constraints_group = QGroupBox("Generate Portfolio: Constraints (Optional)")
+        constraints_layout = QFormLayout(constraints_group)
+
+        constraints_caption = QLabel(
+            "Leave these off to run a standard, unconstrained Max Sharpe "
+            "optimization. Enable any control below to generate a "
+            "portfolio that also satisfies it."
+        )
+        constraints_caption.setWordWrap(True)
+        constraints_caption.setStyleSheet("color: #666; font-size: 11px;")
+        constraints_layout.addRow(constraints_caption)
+
+        self._min_return_check = QCheckBox("Require a minimum annualized return")
+        self._min_return_spin = QDoubleSpinBox()
+        self._min_return_spin.setRange(-50.0, 200.0)
+        self._min_return_spin.setDecimals(1)
+        self._min_return_spin.setSuffix(" %")
+        self._min_return_spin.setValue(10.0)
+        self._min_return_spin.setEnabled(False)
+        self._min_return_check.toggled.connect(self._min_return_spin.setEnabled)
+        constraints_layout.addRow(self._min_return_check)
+        constraints_layout.addRow("Minimum return", self._min_return_spin)
+
+        self._max_volatility_check = QCheckBox("Cap the annualized volatility")
+        self._max_volatility_spin = QDoubleSpinBox()
+        self._max_volatility_spin.setRange(0.0, 200.0)
+        self._max_volatility_spin.setDecimals(1)
+        self._max_volatility_spin.setSuffix(" %")
+        self._max_volatility_spin.setValue(20.0)
+        self._max_volatility_spin.setEnabled(False)
+        self._max_volatility_check.toggled.connect(
+            self._max_volatility_spin.setEnabled
+        )
+        constraints_layout.addRow(self._max_volatility_check)
+        constraints_layout.addRow("Maximum volatility", self._max_volatility_spin)
+
+        # Per-asset allocation band. Applied as the same [min, max] bound
+        # to every selected ticker -- e.g. (0%, 25%) caps any single
+        # position at a quarter of the portfolio.
+        self._min_weight_spin = QDoubleSpinBox()
+        self._min_weight_spin.setRange(0.0, 100.0)
+        self._min_weight_spin.setDecimals(0)
+        self._min_weight_spin.setSuffix(" %")
+        self._min_weight_spin.setValue(0.0)
+
+        self._max_weight_spin = QDoubleSpinBox()
+        self._max_weight_spin.setRange(0.0, 100.0)
+        self._max_weight_spin.setDecimals(0)
+        self._max_weight_spin.setSuffix(" %")
+        self._max_weight_spin.setValue(100.0)
+
+        constraints_layout.addRow("Min allocation per asset", self._min_weight_spin)
+        constraints_layout.addRow("Max allocation per asset", self._max_weight_spin)
+
+        layout.addWidget(constraints_group)
+
         # -- Run button -----------------------------------------------------
-        self._run_button = QPushButton("Run Optimization")
+        self._run_button = QPushButton("Generate Portfolio")
         self._run_button.clicked.connect(self._on_run_clicked)
         layout.addWidget(self._run_button)
         layout.addStretch(1)
- 
+
     def _on_risk_free_changed(self, raw_value: int) -> None:
         rate = raw_value * RISK_FREE_STEP
         self._risk_free_value_label.setText(f"{rate:.4f}")
- 
+
     def _selected_tickers(self) -> List[str]:
         selected = []
         for index in range(self._ticker_list.count()):
@@ -343,20 +436,55 @@ class ConfigurationPanel(QWidget):
             if item.checkState() == Qt.CheckState.Checked:
                 selected.append(item.text())
         return selected
- 
+
+    def _collect_constraints(self) -> Dict[str, Optional[float]]:
+        """
+        Gather the optional Generate Portfolio constraints as a plain dict.
+
+        Values are converted from the percentage scale shown in the UI
+        to the fractional scale (e.g. 0.10) that `PortfolioOptimizer`
+        expects.
+
+        Returns:
+            Dict[str, Optional[float]]: 'min_return' and 'max_volatility'
+                are each a fraction, or `None` if their checkbox is
+                unchecked (no constraint). 'min_weight' and 'max_weight'
+                are always populated fractions, defaulting to the
+                unconstrained `(0.0, 1.0)` allocation range.
+        """
+        return {
+            "min_return": (
+                self._min_return_spin.value() / 100.0
+                if self._min_return_check.isChecked()
+                else None
+            ),
+            "max_volatility": (
+                self._max_volatility_spin.value() / 100.0
+                if self._max_volatility_check.isChecked()
+                else None
+            ),
+            "min_weight": self._min_weight_spin.value() / 100.0,
+            "max_weight": self._max_weight_spin.value() / 100.0,
+        }
+
     def _on_run_clicked(self) -> None:
         tickers = self._selected_tickers()
         start_date: dt.date = self._start_date_edit.date().toPython()
         end_date: dt.date = self._end_date_edit.date().toPython()
         risk_free_rate = self._risk_free_slider.value() * RISK_FREE_STEP
+        constraints = self._collect_constraints()
         self.run_requested.emit(
-            tickers, start_date.isoformat(), end_date.isoformat(), risk_free_rate
+            tickers,
+            start_date.isoformat(),
+            end_date.isoformat(),
+            risk_free_rate,
+            constraints,
         )
- 
+
     def set_enabled(self, enabled: bool) -> None:
         """Disable the trigger while a background optimization is running."""
         self._run_button.setEnabled(enabled)
-        self._run_button.setText("Run Optimization" if enabled else "Running...")
+        self._run_button.setText("Generate Portfolio" if enabled else "Running...")
  
  
 # ---------------------------------------------------------------------------
@@ -555,22 +683,28 @@ class MainWindow(QMainWindow):
         start_date: str,
         end_date: str,
         risk_free_rate: float,
+        constraints: Dict[str, Optional[float]],
     ) -> None:
         if len(tickers) < 2:
             self._results_panel.show_warning(
                 "Please select at least 2 assets to optimize a portfolio."
             )
             return
- 
+
         # Guard against overlapping runs -- ignore a new request while one
         # is already in flight rather than racing two threads against the
         # same ResultsPanel widgets.
         if self._worker is not None and self._worker.isRunning():
             return
- 
+
         self._config_panel.set_enabled(False)
         self._worker = OptimizationWorker(
-            self._data_cache, tickers, start_date, end_date, risk_free_rate
+            self._data_cache,
+            tickers,
+            start_date,
+            end_date,
+            risk_free_rate,
+            constraints,
         )
         self._worker.succeeded.connect(self._results_panel.show_result)
         self._worker.failed.connect(self._results_panel.show_error)
@@ -593,6 +727,3 @@ def main() -> None:
  
 if __name__ == "__main__":
     main()
- 
-
-
