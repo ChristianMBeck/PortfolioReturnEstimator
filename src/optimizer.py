@@ -1,24 +1,20 @@
 """
 optimizer.py
 ============
-
 Modern Portfolio Theory (MPT) utilities for a Quantitative Portfolio
 Optimization Dashboard.
-
 This module exposes a single class, `PortfolioOptimizer`, which wraps a
 DataFrame of daily log returns (index = Dates, columns = tickers) and
 provides methods to:
-
 1. Compute annualized portfolio performance metrics (return, volatility,
    Sharpe ratio) for an arbitrary weight vector.
 2. Solve for the Maximum Sharpe Ratio portfolio subject to a
    fully-invested, long-only constraint using `scipy.optimize.minimize`,
    using either the raw sample covariance matrix or a Ledoit-Wolf
-   shrinkage estimate of the covariance matrix.
-
+   shrinkage estimate of the covariance matrix, or a Ridge-regression
+   expected-return model in place of the historical-mean estimate.
 Author: Quantitative Portfolio Optimization Dashboard
 """
-
 from __future__ import annotations
 
 from typing import Dict, List, Tuple
@@ -28,20 +24,26 @@ import pandas as pd
 from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
+from src.expected_returns_model import get_ml_expected_return_estimator
+
 # Number of trading days used to annualize daily statistics.
 TRADING_DAYS_PER_YEAR: int = 252
+
+# Default path to the historical price CSV dataset, used only by
+# `optimize_max_sharpe_ml` to fetch the extra trailing history (and
+# Volume data) its expected-return model needs beyond what's in
+# `self.log_returns`. Matches DATA_FILE_PATH in app.py.
+DEFAULT_DATA_FILE_PATH: str = "data/stock_details_5_years.csv"
 
 
 class PortfolioOptimizer:
     """
     Encapsulates Modern Portfolio Theory (MPT) calculations and
     Max Sharpe Ratio optimization for a universe of assets.
-
     The class is initialized with a DataFrame of daily log returns and
     exposes methods to evaluate portfolio performance and to solve for
     the weight allocation that maximizes the Sharpe ratio, subject to
     a fully-invested, long-only constraint.
-
     Attributes:
         log_returns (pd.DataFrame): Daily log returns indexed by date,
             with one column per ticker.
@@ -50,13 +52,11 @@ class PortfolioOptimizer:
     def __init__(self, log_returns: pd.DataFrame) -> None:
         """
         Initialize the PortfolioOptimizer with a daily log returns dataset.
-
         Args:
             log_returns (pd.DataFrame): A pivoted DataFrame where the
                 index represents Dates and the columns are individual
                 stock ticker strings (e.g., 'AAPL', 'MSFT', 'GOOGL').
                 Values are daily log returns.
-
         Raises:
             TypeError: If `log_returns` is not a pandas DataFrame.
             ValueError: If `log_returns` is empty.
@@ -65,7 +65,6 @@ class PortfolioOptimizer:
             raise TypeError("log_returns must be a pandas DataFrame.")
         if log_returns.empty:
             raise ValueError("log_returns DataFrame cannot be empty.")
-
         self.log_returns: pd.DataFrame = log_returns
 
     def calculate_portfolio_performance(
@@ -77,7 +76,6 @@ class PortfolioOptimizer:
     ) -> Tuple[float, float, float]:
         """
         Calculate annualized portfolio return, volatility, and Sharpe ratio.
-
         Args:
             weights (np.ndarray): Array of portfolio weights, one per asset,
                 assumed to be aligned with the order of `expected_returns`
@@ -89,16 +87,13 @@ class PortfolioOptimizer:
                 * 252).
             risk_free_rate (float, optional): The risk-free rate used in
                 the Sharpe ratio calculation. Defaults to 0.0.
-
         Returns:
             Tuple[float, float, float]: A tuple of
                 (annualized_portfolio_return, annualized_portfolio_volatility,
                 sharpe_ratio).
         """
         weights = np.asarray(weights, dtype=float)
-
         annualized_portfolio_return: float = float(np.dot(weights, expected_returns))
-
         annualized_portfolio_variance: float = float(
             np.dot(weights.T, np.dot(cov_matrix, weights))
         )
@@ -112,13 +107,6 @@ class PortfolioOptimizer:
             sharpe_ratio = (
                 annualized_portfolio_return - risk_free_rate
             ) / annualized_portfolio_volatility
-
-
-        print("--- QUANT DIAGNOSTIC CHECK ---")
-        print("Log Returns Sample:\n", expected_returns.head(2))
-        print("Expected Returns (Annualized):\n", expected_returns.head(5))
-        print("Covariance Matrix Sample:\n", cov_matrix.iloc[:3, :3])
-        print("------------------------------")
 
         return (
             annualized_portfolio_return,
@@ -135,17 +123,14 @@ class PortfolioOptimizer:
     ) -> float:
         """
         Objective function for the optimizer: the negative Sharpe ratio.
-
         `scipy.optimize.minimize` only minimizes, so to find the weights
         that *maximize* the Sharpe ratio, we minimize its negation.
-
         Args:
             weights (np.ndarray): Candidate portfolio weights.
             expected_returns (pd.Series): Annualized expected returns per asset.
             cov_matrix (pd.DataFrame): Annualized covariance matrix.
             risk_free_rate (float): Risk-free rate used in the Sharpe
                 ratio calculation.
-
         Returns:
             float: The negative Sharpe ratio for the given weights.
         """
@@ -157,15 +142,12 @@ class PortfolioOptimizer:
     def _get_filtered_returns(self, tickers: List[str]) -> pd.DataFrame:
         """
         Validate the requested tickers and filter the internal dataset.
-
         Args:
             tickers (List[str]): List of ticker strings to include in the
                 optimization universe.
-
         Returns:
             pd.DataFrame: The internal log returns filtered down to the
                 requested tickers, with any rows containing NaNs dropped.
-
         Raises:
             ValueError: If `tickers` is empty or contains tickers not
                 found in the dataset.
@@ -196,11 +178,9 @@ class PortfolioOptimizer:
     ) -> Dict[str, object]:
         """
         Run the constrained SLSQP optimization to maximize the Sharpe ratio.
-
         Shared by all `optimize_max_sharpe*`/`optimize_with_constraints`
         variants once each has produced its own estimate of
         `expected_returns` and `cov_matrix`.
-
         Args:
             tickers (List[str]): Ticker strings, aligned with the order of
                 `expected_returns` and `cov_matrix`.
@@ -223,7 +203,6 @@ class PortfolioOptimizer:
                 convergence-failure error message to help identify *why*
                 a constrained solve failed (e.g. which constraints were
                 active). Defaults to `""`.
-
         Returns:
             Dict[str, object]: A dictionary with the following keys:
                 - 'weights' (Dict[str, float]): Optimal weight per ticker.
@@ -231,7 +210,6 @@ class PortfolioOptimizer:
                 - 'volatility' (float): Optimized annualized portfolio
                   volatility.
                 - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
-
         Raises:
             ValueError: If the optimizer fails to converge.
         """
@@ -266,7 +244,6 @@ class PortfolioOptimizer:
             )
 
         optimal_weights: np.ndarray = optimization_result.x
-
         (
             optimized_return,
             optimized_volatility,
@@ -291,27 +268,23 @@ class PortfolioOptimizer:
     ) -> Dict[str, object]:
         """
         Solve for the portfolio weights that maximize the Sharpe ratio.
-
         Filters the internal log returns dataset down to the requested
         tickers, computes historical annualized expected returns and the
         sample annualized covariance matrix, and runs a constrained SLSQP
         optimization (fully invested, long-only) to find the
         Max Sharpe Ratio portfolio.
-
         Note:
             The sample covariance matrix used here is a standard historical
             estimate. For a large number of assets relative to the number
             of observations, this estimate can be noisy/ill-conditioned;
             see `optimize_max_sharpe_shrinkage` for a more robust
             Ledoit-Wolf shrinkage alternative.
-
         Args:
             tickers (List[str]): List of ticker strings to include in the
                 optimization universe. Must all be present as columns in
                 the internal log returns DataFrame.
             risk_free_rate (float, optional): The risk-free rate used in
                 the Sharpe ratio calculation. Defaults to 0.0.
-
         Returns:
             Dict[str, object]: A dictionary with the following keys:
                 - 'weights' (Dict[str, float]): Optimal weight per ticker.
@@ -319,7 +292,6 @@ class PortfolioOptimizer:
                 - 'volatility' (float): Optimized annualized portfolio
                   volatility.
                 - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
-
         Raises:
             ValueError: If `tickers` is empty, contains tickers not found
                 in the dataset, or if the optimizer fails to converge.
@@ -328,7 +300,6 @@ class PortfolioOptimizer:
 
         # Historical expected annualized returns (mean daily return * 252).
         expected_returns: pd.Series = filtered_returns.mean() * TRADING_DAYS_PER_YEAR
-
         # Sample annualized covariance matrix (daily covariance * 252).
         cov_matrix: pd.DataFrame = filtered_returns.cov() * TRADING_DAYS_PER_YEAR
 
@@ -348,23 +319,19 @@ class PortfolioOptimizer:
         """
         Generate a Max Sharpe Ratio portfolio subject to user-supplied
         return, volatility, and allocation constraints.
-
         This mirrors `optimize_max_sharpe` (same historical sample
         covariance/expected-return estimates, same fully-invested,
         long-only-by-default objective), but layers on up to three
         optional constraints:
-
         - A minimum acceptable annualized portfolio return.
         - A maximum acceptable annualized portfolio volatility.
         - A per-asset allocation band (the same `[min_weight, max_weight]`
           bound is applied to every asset in `tickers`), e.g. to cap
           concentration in any single position or to force a minimum
           stake in every selected asset.
-
         Any constraint left at its default is simply not imposed, so
         calling this with no optional arguments reproduces the same
         result as `optimize_max_sharpe`.
-
         Args:
             tickers (List[str]): List of ticker strings to include in the
                 optimization universe. Must all be present as columns in
@@ -383,7 +350,6 @@ class PortfolioOptimizer:
             max_weight (float, optional): Maximum allocation any single
                 asset may receive, as a fraction of the portfolio (e.g.
                 `0.30` for 30%). Defaults to `1.0`.
-
         Returns:
             Dict[str, object]: A dictionary with the following keys:
                 - 'weights' (Dict[str, float]): Optimal weight per ticker.
@@ -391,7 +357,6 @@ class PortfolioOptimizer:
                 - 'volatility' (float): Optimized annualized portfolio
                   volatility.
                 - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
-
         Raises:
             ValueError: If `tickers` is empty, contains tickers not found
                 in the dataset; if `min_weight`/`max_weight` are invalid
@@ -498,7 +463,6 @@ class PortfolioOptimizer:
         """
         Solve for the Max Sharpe Ratio portfolio using a Ledoit-Wolf
         shrinkage estimate of the covariance matrix.
-
         This mirrors `optimize_max_sharpe` exactly (same expected-returns
         estimate, same constraints, bounds, and objective), but replaces
         the raw sample covariance matrix with a Ledoit-Wolf shrinkage
@@ -508,14 +472,12 @@ class PortfolioOptimizer:
         allocations than the raw sample covariance -- particularly useful
         when the number of assets is large relative to the number of
         historical observations.
-
         Args:
             tickers (List[str]): List of ticker strings to include in the
                 optimization universe. Must all be present as columns in
                 the internal log returns DataFrame.
             risk_free_rate (float, optional): The risk-free rate used in
                 the Sharpe ratio calculation. Defaults to 0.0.
-
         Returns:
             Dict[str, object]: A dictionary with the following keys:
                 - 'weights' (Dict[str, float]): Optimal weight per ticker.
@@ -523,7 +485,6 @@ class PortfolioOptimizer:
                 - 'volatility' (float): Optimized annualized portfolio
                   volatility.
                 - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
-
         Raises:
             ValueError: If `tickers` is empty, contains tickers not found
                 in the dataset, or if the optimizer fails to converge.
@@ -545,6 +506,73 @@ class PortfolioOptimizer:
         cov_matrix: pd.DataFrame = pd.DataFrame(
             shrunk_cov_values, index=tickers, columns=tickers
         )
+
+        return self._solve_max_sharpe(
+            tickers, expected_returns, cov_matrix, risk_free_rate
+        )
+
+    def optimize_max_sharpe_ml(
+        self,
+        tickers: List[str],
+        risk_free_rate: float = 0.0,
+        data_file_path: str = DEFAULT_DATA_FILE_PATH,
+    ) -> Dict[str, object]:
+        """
+        Solve for the Max Sharpe Ratio portfolio using a trained Ridge
+        regression model to estimate expected returns, in place of the
+        trailing-historical-mean estimate used by `optimize_max_sharpe`.
+
+        This mirrors `optimize_max_sharpe` exactly in every other respect
+        (same sample covariance matrix, same fully-invested, long-only
+        objective and constraints) -- the only difference is how
+        `expected_returns` is produced.
+
+        The model (see `train_expected_return_model.py` at the project
+        root and `src/expected_returns_model.py`) predicts each asset's
+        annualized return over the next ~63 trading days from trailing
+        momentum, volatility, and volume-trend features. On a held-out,
+        time-purged test set it achieved a 36.7% lower mean absolute error
+        than the trailing-historical-mean baseline (see
+        `src/models/evaluation_report.json`).
+
+        Note:
+            The model needs ~126 trailing trading days of price/volume
+            history *and* access to the original CSV dataset (for Volume,
+            which `self.log_returns` doesn't carry) -- see
+            `data_file_path`. Any ticker with insufficient history falls
+            back to the same trailing-mean formula `optimize_max_sharpe`
+            uses, rather than failing the whole optimization.
+
+        Args:
+            tickers (List[str]): List of ticker strings to include in the
+                optimization universe. Must all be present as columns in
+                the internal log returns DataFrame.
+            risk_free_rate (float, optional): The risk-free rate used in
+                the Sharpe ratio calculation. Defaults to 0.0.
+            data_file_path (str, optional): Path to the historical price
+                CSV dataset the expected-return model reads its extra
+                trailing history and Volume data from. Defaults to
+                `DEFAULT_DATA_FILE_PATH` (matches `DATA_FILE_PATH` in
+                app.py).
+        Returns:
+            Dict[str, object]: A dictionary with the following keys:
+                - 'weights' (Dict[str, float]): Optimal weight per ticker.
+                - 'return' (float): Optimized annualized portfolio return.
+                - 'volatility' (float): Optimized annualized portfolio
+                  volatility.
+                - 'sharpe_ratio' (float): Optimized (maximized) Sharpe ratio.
+        Raises:
+            ValueError: If `tickers` is empty, contains tickers not found
+                in the dataset, or if the optimizer fails to converge.
+        """
+        filtered_returns: pd.DataFrame = self._get_filtered_returns(tickers)
+
+        estimator = get_ml_expected_return_estimator()
+        expected_returns: pd.Series = estimator.estimate(data_file_path, tickers)
+
+        # Same sample annualized covariance matrix as optimize_max_sharpe,
+        # so the only difference in the result comes from expected_returns.
+        cov_matrix: pd.DataFrame = filtered_returns.cov() * TRADING_DAYS_PER_YEAR
 
         return self._solve_max_sharpe(
             tickers, expected_returns, cov_matrix, risk_free_rate
